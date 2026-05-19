@@ -29,6 +29,62 @@ static char      g_label[MAX_LABEL] = "";
 static time_t    g_session_start    = 0;
 static double    g_active_secs      = 0.0;
 
+/* bell */
+
+#define BELL_SAMPLE_RATE  44100
+#define BELL_DURATION_SEC 1.8f      /* fade-out duration                    */
+#define BELL_FREQ_HZ      520.0f    /* fundamental — clean, not harsh       */
+#define BELL_FREQ2_HZ     780.0f    /* fifth above — warmth                 */
+#define BELL_SAMPLES      79464   /* 44100 * 1.8 */
+
+static AudioStream g_bell_stream;
+static short       g_bell_buf[BELL_SAMPLES];
+static int         g_bell_pos     = -1;   /* -1 = not playing               */
+static int         g_bell_muted   = 0;
+static int         g_audio_ready  = 0;
+
+static void bell_generate(void) {
+    for (int i = 0; i < BELL_SAMPLES; i++) {
+        float t       = (float)i / BELL_SAMPLE_RATE;
+        float env     = expf(-t * 2.8f);                        /* exponential decay */
+        float wave    = 0.65f * sinf(2.0f * PI * BELL_FREQ_HZ  * t)
+                      + 0.35f * sinf(2.0f * PI * BELL_FREQ2_HZ * t);
+        g_bell_buf[i] = (short)(wave * env * 28000.0f);
+    }
+}
+
+static void bell_init(void) {
+    InitAudioDevice();
+    if (!IsAudioDeviceReady()) return;
+    bell_generate();
+    g_bell_stream = LoadAudioStream(BELL_SAMPLE_RATE, 16, 1);
+    g_audio_ready = 1;
+}
+
+static void bell_play(void) {
+    if (!g_audio_ready || g_bell_muted) return;
+    g_bell_pos = 0;
+}
+
+/* called every frame — streams chunks into raylib */
+static void bell_update(void) {
+    if (!g_audio_ready || g_bell_pos < 0) return;
+    if (IsAudioStreamProcessed(g_bell_stream)) {
+        int remaining = BELL_SAMPLES - g_bell_pos;
+        if (remaining <= 0) { g_bell_pos = -1; return; }
+        int chunk = remaining < 4096 ? remaining : 4096;
+        UpdateAudioStream(g_bell_stream, g_bell_buf + g_bell_pos, chunk);
+        if (g_bell_pos == 0) PlayAudioStream(g_bell_stream);
+        g_bell_pos += chunk;
+    }
+}
+
+static void bell_close(void) {
+    if (!g_audio_ready) return;
+    UnloadAudioStream(g_bell_stream);
+    CloseAudioDevice();
+}
+
 /* log path */
 
 static void get_log_path(char *out, int sz) {
@@ -49,20 +105,15 @@ static void fmt_duration(double secs_f, char *out, int sz) {
 
 static void log_session(const char *status) {
     if (g_active_secs < 5.0) return;
-
     char path[512];
     get_log_path(path, sizeof path);
-
     FILE *f = fopen(path, "a");
     if (!f) return;
-
     char ts[32];
     struct tm *tm_info = localtime(&g_session_start);
     strftime(ts, sizeof ts, "%Y-%m-%dT%H:%M:%S", tm_info);
-
     char dur[32];
     fmt_duration(g_active_secs, dur, sizeof dur);
-
     const char *lbl = g_label[0] ? g_label : "-";
     fprintf(f, "%s | %s | %-20s | %s\n", ts, dur, lbl, status);
     fclose(f);
@@ -79,12 +130,8 @@ static int parse_log_duration(const char *s) {
 static void cmd_stats(void) {
     char path[512];
     get_log_path(path, sizeof path);
-
     FILE *f = fopen(path, "r");
-    if (!f) {
-        printf("yduts: no log found at %s\n", path);
-        return;
-    }
+    if (!f) { printf("yduts: no log found at %s\n", path); return; }
 
     time_t now = time(NULL);
     struct tm *now_tm = localtime(&now);
@@ -106,69 +153,54 @@ static void cmd_stats(void) {
     char line[512];
     while (fgets(line, sizeof line, f)) {
         char ts[32], dur[32], lbl[MAX_LABEL], status[32];
-        if (sscanf(line, "%31s | %31s | %127[^|] | %31s", ts, dur, lbl, status) != 4)
-            continue;
-
-        /* trim trailing spaces */
+        if (sscanf(line, "%31s | %31s | %127[^|] | %31s", ts, dur, lbl, status) != 4) continue;
         int ll = (int)strlen(lbl);
         while (ll > 0 && lbl[ll-1] == ' ') lbl[--ll] = '\0';
-
         struct tm entry_tm = {0};
         if (!strptime(ts, "%Y-%m-%dT%H:%M:%S", &entry_tm)) continue;
         time_t entry_t = mktime(&entry_tm);
-
         int secs = parse_log_duration(dur);
         total_all += secs; count_all++;
         if (entry_t >= week_t)  { total_week  += secs; count_week++;  }
         if (entry_t >= today_t) { total_today += secs; count_today++; }
-
         if (strcmp(lbl, "-") != 0) {
             int found = 0;
             for (int i = 0; i < topic_count; i++) {
-                if (strcmp(topic_names[i], lbl) == 0) {
-                    topic_secs[i] += secs; found = 1; break;
-                }
+                if (strcmp(topic_names[i], lbl) == 0) { topic_secs[i] += secs; found = 1; break; }
             }
             if (!found && topic_count < MAX_TOPICS) {
                 snprintf(topic_names[topic_count], MAX_LABEL, "%s", lbl);
-                topic_secs[topic_count] = secs;
-                topic_count++;
+                topic_secs[topic_count++] = secs;
             }
         }
     }
     fclose(f);
 
+    /* sort topics by time desc */
+    for (int i = 0; i < topic_count - 1; i++)
+        for (int j = i+1; j < topic_count; j++)
+            if (topic_secs[j] > topic_secs[i]) {
+                double td = topic_secs[i]; topic_secs[i] = topic_secs[j]; topic_secs[j] = td;
+                char tmp[MAX_LABEL]; strcpy(tmp, topic_names[i]);
+                strcpy(topic_names[i], topic_names[j]); strcpy(topic_names[j], tmp);
+            }
+
     char buf[32];
     printf("\n  yduts · study log\n");
     printf("  ─────────────────────────────\n");
-
     fmt_duration(total_today, buf, sizeof buf);
     printf("  today      %s  (%d session%s)\n", buf, count_today, count_today==1?"":"s");
-
     fmt_duration(total_week, buf, sizeof buf);
     printf("  this week  %s  (%d session%s)\n", buf, count_week, count_week==1?"":"s");
-
     fmt_duration(total_all, buf, sizeof buf);
     printf("  all time   %s  (%d session%s)\n", buf, count_all, count_all==1?"":"s");
-
     if (topic_count > 0) {
-        /* sort by time desc */
-        for (int i = 0; i < topic_count - 1; i++)
-            for (int j = i+1; j < topic_count; j++)
-                if (topic_secs[j] > topic_secs[i]) {
-                    double td = topic_secs[i]; topic_secs[i] = topic_secs[j]; topic_secs[j] = td;
-                    char tmp[MAX_LABEL];
-                    strcpy(tmp, topic_names[i]);
-                    strcpy(topic_names[i], topic_names[j]);
-                    strcpy(topic_names[j], tmp);
-                }
         printf("\n  by topic:\n");
         for (int i = 0; i < topic_count; i++) {
             fmt_duration(topic_secs[i], buf, sizeof buf);
             printf("    %-22s %s\n", topic_names[i], buf);
         }
     }
-
     printf("  ─────────────────────────────\n");
     printf("  log: %s\n\n", path);
 }
@@ -178,10 +210,10 @@ static void cmd_stats(void) {
 static int parse_duration(const char *s) {
     int total = 0, val = 0, found = 0;
     for (; *s; s++) {
-        if (*s >= '0' && *s <= '9') { val = val * 10 + (*s - '0'); found = 1; }
-        else if (*s == 'h' || *s == 'H') { total += val * 3600; val = 0; }
-        else if (*s == 'm' || *s == 'M') { total += val * 60;   val = 0; }
-        else if (*s == 's' || *s == 'S') { total += val;        val = 0; }
+        if      (*s >= '0' && *s <= '9')    { val = val * 10 + (*s - '0'); found = 1; }
+        else if (*s == 'h' || *s == 'H')    { total += val * 3600; val = 0; }
+        else if (*s == 'm' || *s == 'M')    { total += val * 60;   val = 0; }
+        else if (*s == 's' || *s == 'S')    { total += val;        val = 0; }
         else return -1;
     }
     if (found && val > 0) total += val;
@@ -222,13 +254,42 @@ static void draw_centered_text(const char *txt, float y, float font_sz, Color co
     DrawTextEx(g_font, txt, pos, font_sz, spacing, col);
 }
 
+/* returns progress 0.0–1.0 for bar; -1 if not applicable */
+static float get_progress(void) {
+    if (g_mode == MODE_STOPWATCH) return -1.0f;
+    double total = 0;
+    if (g_mode == MODE_COUNTDOWN) total = g_target;
+    else total = (g_pomo_phase == POMO_WORK) ? POMO_WORK_SECS : POMO_BREAK_SECS;
+    if (total <= 0) return -1.0f;
+    float p = (float)(g_elapsed / total);
+    if (p < 0.0f) p = 0.0f;
+    if (p > 1.0f) p = 1.0f;
+    return p;
+}
+
+static void draw_progress_bar(int W, int H, float progress) {
+    /* 2px bar pinned to bottom, dims when paused */
+    int bar_h  = 2;
+    int bar_y  = H - bar_h;
+    int bar_w  = (int)(W * progress);
+
+    Color col = g_finished ? FG_RED : (g_paused ? FG_DIM : FG);
+    col.a = g_paused ? 80 : 160;   /* subtle always, dimmer when paused */
+
+    /* track */
+    DrawRectangle(0, bar_y, W, bar_h, (Color){18, 18, 18, 255});
+    /* fill */
+    if (bar_w > 0)
+        DrawRectangle(0, bar_y, bar_w, bar_h, col);
+}
+
 static void draw_frame(void) {
     int W = GetScreenWidth(), H = GetScreenHeight();
     float cy = H * 0.48f;
 
     ClearBackground(BG);
 
-    /* main timer */
+    /* ── main timer ── */
     char tbuf[32];
     fmt_time(g_elapsed, tbuf, sizeof tbuf);
 
@@ -251,7 +312,7 @@ static void draw_frame(void) {
         draw_centered_text(g_label, cy - font_sz * 0.58f, lbl_sz, FG_DIM);
     }
 
-    /* mode/status line below timer */
+    /* ── mode/status line below timer ── */
     char status[128] = "";
     if (g_mode == MODE_POMODORO) {
         const char *phase = (g_pomo_phase == POMO_WORK) ? "work" : "break";
@@ -261,21 +322,34 @@ static void draw_frame(void) {
     } else {
         snprintf(status, sizeof status, "stopwatch");
     }
-    if (g_paused) {
-        size_t n = strlen(status);
-        snprintf(status + n, sizeof status - n, " · paused");
-    }
+    if (g_paused) { size_t n = strlen(status); snprintf(status+n, sizeof status-n, " · paused"); }
     float status_sz = H * 0.022f;
     if (status_sz < 11) status_sz = 11;
     draw_centered_text(status, cy + font_sz * 0.60f, status_sz, FG_DIM);
 
+    /* ── mute indicator (top-right, tiny) ── */
+    if (g_bell_muted) {
+        float msz = H * 0.018f;
+        if (msz < 10) msz = 10;
+        float spacing = msz * 0.04f;
+        Vector2 sz = MeasureTextEx(g_font, "muted", msz, spacing);
+        Vector2 pos = { W - sz.x - W * 0.02f, H * 0.03f };
+        DrawTextEx(g_font, "muted", pos, msz, spacing, (Color){40,40,40,255});
+    }
+
     /* ── key hints (bottom) ── */
-    const char *hints = "SPACE pause · r restart · f fullscreen · q quit";
+    const char *hints = "SPACE pause · r restart · m mute · f fullscreen · q quit";
     if (g_mode == MODE_POMODORO)
-        hints = "SPACE pause · r restart · n next · f fullscreen · q quit";
+        hints = "SPACE pause · r restart · n next · m mute · f fullscreen · q quit";
     float hint_sz = H * 0.016f;
     if (hint_sz < 10) hint_sz = 10;
-    draw_centered_text(hints, H - H * 0.038f, hint_sz, (Color){40,40,40,255});
+    /* push hints up a tiny bit so bar doesn't overlap them */
+    draw_centered_text(hints, H - H * 0.05f, hint_sz, (Color){40,40,40,255});
+
+    /* ── progress bar ── */
+    float progress = get_progress();
+    if (progress >= 0.0f)
+        draw_progress_bar(W, H, progress);
 }
 
 /* logic */
@@ -308,9 +382,11 @@ static void handle_input(void) {
     if (IsKeyPressed(KEY_SPACE)) g_paused = !g_paused;
     if (IsKeyPressed(KEY_R))     restart_session();
     if (IsKeyPressed(KEY_F))     ToggleFullscreen();
+    if (IsKeyPressed(KEY_M))     g_bell_muted = !g_bell_muted;
     if (IsKeyPressed(KEY_N) && g_mode == MODE_POMODORO) next_pomo();
     if (IsKeyPressed(KEY_Q) || IsKeyPressed(KEY_ESCAPE)) {
         log_session(g_finished ? "completed" : "interrupted");
+        bell_close();
         CloseWindow();
     }
 }
@@ -331,11 +407,16 @@ static void tick(double dt) {
                 log_session("completed");
                 g_active_secs   = 0.0;
                 g_session_start = time(NULL);
+                bell_play();
             }
             break;
         case MODE_POMODORO:
             g_elapsed -= dt;
-            if (g_elapsed <= 0) { g_elapsed = 0; g_finished = 1; }
+            if (g_elapsed <= 0) {
+                g_elapsed  = 0;
+                g_finished = 1;
+                bell_play();
+            }
             break;
     }
 }
@@ -391,8 +472,10 @@ int main(int argc, char **argv) {
     SetExitKey(0);
 
     load_font();
+    bell_init();
 
     while (!WindowShouldClose()) {
+        bell_update();
         handle_input();
         tick(GetFrameTime());
         BeginDrawing();
@@ -402,6 +485,7 @@ int main(int argc, char **argv) {
 
     log_session(g_finished ? "completed" : "interrupted");
     if (g_font_loaded) UnloadFont(g_font);
+    bell_close();
     CloseWindow();
     return 0;
 }

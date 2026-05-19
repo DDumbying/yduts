@@ -34,6 +34,7 @@ make
 ./yduts 1h30m "algorithms"        # countdown with session label
 ./yduts pomodoro "linear algebra" # 25m/5m loop with label
 ./yduts -p 25m "networks"         # start paused
+./yduts -m                        # mute / unmute
 ./yduts stats                     # print study summary
 ```
 
@@ -61,6 +62,7 @@ make
 | `SPACE`   | Pause / Resume                      |
 | `r`       | Restart current session             |
 | `n`       | Next pomodoro phase (pomodoro only) |
+| `m`       | mute / unmute                       |
 | `f`       | Toggle fullscreen                   |
 | `q`/`ESC` | Quit (saves session to log)         |
 
