@@ -10,16 +10,8 @@ Aesthetic inspired by [sowon](https://github.com/tsoding/sowon).
 
 ## Build
 
-### Ubuntu / Debian
+> There is not **Ubuntu / Debian** because i don't like lazy guys.
 
-```sh
-sudo apt-get install -y libgl-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev cmake git
-git clone --depth 1 --branch 5.0 https://github.com/raysan5/raylib.git /tmp/raylib
-cd /tmp/raylib && mkdir build && cd build
-cmake -DPLATFORM=Desktop -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF .. -DCMAKE_INSTALL_PREFIX=/usr/local
-make -j$(nproc) && sudo make install
-cd /path/to/yduts && make
-```
 ### Arch and so on
 
 ```sh
