@@ -8,8 +8,6 @@ Aesthetic inspired by [sowon](https://github.com/tsoding/sowon).
 00:25:00
 ```
 
----
-
 ## Build
 
 ### Ubuntu / Debian
@@ -22,14 +20,12 @@ cmake -DPLATFORM=Desktop -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF .. -
 make -j$(nproc) && sudo make install
 cd /path/to/yduts && make
 ```
-
 ### Arch and so on
 
 ```sh
 sudo pacman -S raylib
 make
 ```
-
 ### macOS (with Homebrew)
 
 ```sh
@@ -38,34 +34,62 @@ brew install raylib
 make
 ```
 
----
-
 ## Usage
 
 ```sh
-./yduts                  # stopwatch (count up)
-./yduts 25m              # countdown 25 minutes
-./yduts 1h30m            # countdown 1 hour 30 minutes
-./yduts 90               # countdown 90 seconds (bare number)
-./yduts pomodoro         # 25m work / 5m break loop
-./yduts -p 25m           # start paused
+./yduts                           # stopwatch (count up)
+./yduts 25m                       # countdown 25 minutes
+./yduts 1h30m "algorithms"        # countdown with session label
+./yduts pomodoro "linear algebra" # 25m/5m loop with label
+./yduts -p 25m "networks"         # start paused
+./yduts stats                     # print study summary
 ```
 
----
+## Stats output
+
+```
+  yduts · study log
+  ─────────────────────────────
+  today      01h04m22s  (3 sessions)
+  this week  03h24m22s  (6 sessions)
+  all time   04h09m22s  (7 sessions)
+
+  by topic:
+    algorithms             01h50m00s
+    operating systems      00h50m00s
+    networks               00h30m00s
+  ─────────────────────────────
+  log: /home/user/.yduts_log
+```
 
 ## Keys
 
-| Key     | Action                              |
-|---------|-------------------------------------|
-| `SPACE` | Pause / Resume                      |
-| `r`     | Restart current session             |
-| `n`     | Next pomodoro phase (pomodoro only) |
-| `f`     | Toggle fullscreen                   |
-| `q`/`ESC` | Quit                             |
+| Key       | Action                              |
+|-----------|-------------------------------------|
+| `SPACE`   | Pause / Resume                      |
+| `r`       | Restart current session             |
+| `n`       | Next pomodoro phase (pomodoro only) |
+| `f`       | Toggle fullscreen                   |
+| `q`/`ESC` | Quit (saves session to log)         |
 
----
+## Log format
+
+Plain text, one line per session:
+
+```
+2026-05-19T08:00:00 | 00h25m00s | algorithms           | completed
+2026-05-19T10:30:00 | 00h14m22s | linear algebra       | interrupted
+```
+
+Statuses: `completed` · `interrupted` · `restarted` · `skipped`
+
+Sessions under 5 seconds are not logged.
 
 ## Font
 
 Place a `.ttf` font at `assets/font.ttf`.
 A handwritten or italic serif font is recommended (e.g. [Caveat](https://fonts.google.com/specimen/Caveat), [Lora Italic](https://fonts.google.com/specimen/Lora)).
+
+## Logs
+
+Logs every session automatically to `~/.yduts_log`.
