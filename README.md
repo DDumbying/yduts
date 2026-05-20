@@ -9,7 +9,7 @@ Aesthetic inspired by [sowon](https://github.com/tsoding/sowon).
 
 ## Build
 
-> There is no **Ubuntu / Debian** section because I don't like lazy guys.
+> Figure it out yourself.
 
 ### Arch and so on
 
