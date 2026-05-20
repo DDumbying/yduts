@@ -9,7 +9,13 @@ Aesthetic inspired by [sowon](https://github.com/tsoding/sowon).
 
 ## Build
 
+### Ubuntu / Debian
+
 > Figure it out yourself.
+
+### Windows
+
+> F Windows
 
 ### Arch and so on
 
@@ -25,6 +31,7 @@ brew install raylib
 # edit Makefile: LDFLAGS = -lraylib -lm
 make
 ```
+> Just because i have one
 
 ## Usage
 
