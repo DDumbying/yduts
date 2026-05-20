@@ -5,15 +5,152 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <ctype.h>
 
 /* types */
 
 typedef enum { MODE_STOPWATCH = 0, MODE_COUNTDOWN, MODE_POMODORO } Mode;
 typedef enum { POMO_WORK = 0, POMO_BREAK } PomoPhase;
 
-#define POMO_WORK_SECS  (25 * 60)
-#define POMO_BREAK_SECS ( 5 * 60)
-#define MAX_LABEL       128
+#define MAX_LABEL    128
+#define MAX_PATH     512
+
+/* config */
+
+typedef struct {
+    char  bell_sound[MAX_PATH];  /* path to .wav/.ogg, empty = use generated */
+    float bell_volume;           /* 0.0 – 1.0 */
+    int   mute;
+    int   pomo_work_secs;
+    int   pomo_break_secs;
+    char  font[MAX_PATH];        /* path to .ttf, empty = assets/font.ttf   */
+    /* theme fields reserved for future use */
+} Config;
+
+static Config g_cfg = {
+    .bell_sound      = "",
+    .bell_volume     = 1.0f,
+    .mute            = 0,
+    .pomo_work_secs  = 25 * 60,
+    .pomo_break_secs =  5 * 60,
+    .font            = "",
+};
+
+/* trim leading/trailing whitespace in-place */
+static char *trim(char *s) {
+    while (isspace((unsigned char)*s)) s++;
+    char *end = s + strlen(s);
+    while (end > s && isspace((unsigned char)*(end-1))) *--end = '\0';
+    return s;
+}
+
+static int cfg_parse_duration(const char *s) {
+    int total = 0, val = 0, found = 0;
+    for (; *s; s++) {
+        if      (*s >= '0' && *s <= '9')    { val = val * 10 + (*s - '0'); found = 1; }
+        else if (*s == 'h' || *s == 'H')    { total += val * 3600; val = 0; }
+        else if (*s == 'm' || *s == 'M')    { total += val * 60;   val = 0; }
+        else if (*s == 's' || *s == 'S')    { total += val;        val = 0; }
+        else return -1;
+    }
+    if (found && val > 0) total += val;
+    return (total > 0) ? total : -1;
+}
+
+static void config_load(void) {
+    const char *home = getenv("HOME");
+    if (!home) home = ".";
+    char path[MAX_PATH];
+    snprintf(path, sizeof path, "%s/.yduts_config", home);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return;   /* no config = all defaults, that's fine */
+
+    char line[MAX_PATH * 2];
+    while (fgets(line, sizeof line, f)) {
+        /* strip comment */
+        char *hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+
+        *eq = '\0';
+        char *key = trim(line);
+        char *val = trim(eq + 1);
+        if (!*key || !*val) continue;
+
+        if (strcmp(key, "bell_sound") == 0) {
+            snprintf(g_cfg.bell_sound, MAX_PATH, "%s", val);
+
+        } else if (strcmp(key, "bell_volume") == 0) {
+            float v = (float)atof(val);
+            if (v < 0.0f) v = 0.0f;
+            if (v > 1.0f) v = 1.0f;
+            g_cfg.bell_volume = v;
+
+        } else if (strcmp(key, "mute") == 0) {
+            g_cfg.mute = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+
+        } else if (strcmp(key, "pomodoro_work") == 0) {
+            int s = cfg_parse_duration(val);
+            if (s > 0) g_cfg.pomo_work_secs = s;
+
+        } else if (strcmp(key, "pomodoro_break") == 0) {
+            int s = cfg_parse_duration(val);
+            if (s > 0) g_cfg.pomo_break_secs = s;
+
+        } else if (strcmp(key, "font") == 0) {
+            snprintf(g_cfg.font, MAX_PATH, "%s", val);
+        }
+        /* unknown keys silently ignored */
+    }
+    fclose(f);
+}
+
+/* write a default config if none exists */
+static void config_init_file(void) {
+    const char *home = getenv("HOME");
+    if (!home) home = ".";
+    char path[MAX_PATH];
+    snprintf(path, sizeof path, "%s/.yduts_config", home);
+
+    FILE *probe = fopen(path, "r");
+    if (probe) { fclose(probe); return; }   /* already exists */
+
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f,
+        "# yduts configuration\n"
+        "# Lines starting with # are comments.\n"
+        "\n"
+        "# Path to a .wav or .ogg file to play when a session ends.\n"
+        "# Leave empty (or comment out) to use the built-in generated tone.\n"
+        "# bell_sound = /home/user/sounds/bell.wav\n"
+        "\n"
+        "# Bell volume: 0.0 (silent) to 1.0 (full)\n"
+        "bell_volume = 1.0\n"
+        "\n"
+        "# Start muted (true/false)\n"
+        "mute = false\n"
+        "\n"
+        "# Pomodoro session lengths\n"
+        "pomodoro_work  = 25m\n"
+        "pomodoro_break = 5m\n"
+        "\n"
+        "# Custom font: path to any .ttf file.\n"
+        "# Defaults to assets/font.ttf (bundled Lora Italic).\n"
+        "# font = /home/user/fonts/Caveat-Regular.ttf\n"
+        "\n"
+        "# Theme (coming soon)\n"
+        "# theme_fg     = e6e6e6\n"
+        "# theme_bg     = 000000\n"
+        "# theme_dim    = 4b4b4b\n"
+        "# theme_alert  = c85050\n"
+    );
+    fclose(f);
+    fprintf(stderr, "yduts: created default config at %s\n", path);
+}
 
 /* globals */
 
@@ -32,43 +169,68 @@ static double    g_active_secs      = 0.0;
 /* bell */
 
 #define BELL_SAMPLE_RATE  44100
-#define BELL_DURATION_SEC 1.8f      /* fade-out duration                    */
-#define BELL_FREQ_HZ      520.0f    /* fundamental — clean, not harsh       */
-#define BELL_FREQ2_HZ     780.0f    /* fifth above — warmth                 */
+#define BELL_DURATION_SEC 1.8f
+#define BELL_FREQ_HZ      520.0f
+#define BELL_FREQ2_HZ     780.0f
 #define BELL_SAMPLES      79464   /* 44100 * 1.8 */
 
+/* generated-tone path */
 static AudioStream g_bell_stream;
 static short       g_bell_buf[BELL_SAMPLES];
-static int         g_bell_pos     = -1;   /* -1 = not playing               */
-static int         g_bell_muted   = 0;
-static int         g_audio_ready  = 0;
+static int         g_bell_pos    = -1;
+static int         g_use_stream  = 0;   /* 1 = streaming generated tone */
+
+/* file-sound path */
+static Sound       g_bell_sound;
+static int         g_use_sound   = 0;   /* 1 = loaded from file */
+
+static int         g_audio_ready = 0;
 
 static void bell_generate(void) {
     for (int i = 0; i < BELL_SAMPLES; i++) {
-        float t       = (float)i / BELL_SAMPLE_RATE;
-        float env     = expf(-t * 2.8f);                        /* exponential decay */
-        float wave    = 0.65f * sinf(2.0f * PI * BELL_FREQ_HZ  * t)
-                      + 0.35f * sinf(2.0f * PI * BELL_FREQ2_HZ * t);
-        g_bell_buf[i] = (short)(wave * env * 28000.0f);
+        float t   = (float)i / BELL_SAMPLE_RATE;
+        float env = expf(-t * 2.8f);
+        float w   = 0.65f * sinf(2.0f * PI * BELL_FREQ_HZ  * t)
+                  + 0.35f * sinf(2.0f * PI * BELL_FREQ2_HZ * t);
+        g_bell_buf[i] = (short)(w * env * 28000.0f * g_cfg.bell_volume);
     }
 }
 
 static void bell_init(void) {
     InitAudioDevice();
     if (!IsAudioDeviceReady()) return;
+    g_audio_ready = 1;
+
+    /* try loading user file first */
+    if (g_cfg.bell_sound[0] != '\0') {
+        g_bell_sound = LoadSound(g_cfg.bell_sound);
+        if (g_bell_sound.frameCount > 0) {
+            SetSoundVolume(g_bell_sound, g_cfg.bell_volume);
+            g_use_sound = 1;
+            return;
+        }
+        fprintf(stderr, "yduts: could not load bell_sound '%s', using built-in tone\n",
+                g_cfg.bell_sound);
+    }
+
+    /* fall back to generated tone */
     bell_generate();
     g_bell_stream = LoadAudioStream(BELL_SAMPLE_RATE, 16, 1);
-    g_audio_ready = 1;
+    SetAudioStreamVolume(g_bell_stream, g_cfg.bell_volume);
+    g_use_stream = 1;
 }
 
 static void bell_play(void) {
-    if (!g_audio_ready || g_bell_muted) return;
-    g_bell_pos = 0;
+    if (!g_audio_ready || g_cfg.mute) return;
+    if (g_use_sound) {
+        PlaySound(g_bell_sound);
+    } else if (g_use_stream) {
+        g_bell_pos = 0;
+    }
 }
 
-/* called every frame — streams chunks into raylib */
 static void bell_update(void) {
-    if (!g_audio_ready || g_bell_pos < 0) return;
+    if (!g_use_stream || g_bell_pos < 0) return;
     if (IsAudioStreamProcessed(g_bell_stream)) {
         int remaining = BELL_SAMPLES - g_bell_pos;
         if (remaining <= 0) { g_bell_pos = -1; return; }
@@ -81,7 +243,8 @@ static void bell_update(void) {
 
 static void bell_close(void) {
     if (!g_audio_ready) return;
-    UnloadAudioStream(g_bell_stream);
+    if (g_use_sound)  UnloadSound(g_bell_sound);
+    if (g_use_stream) UnloadAudioStream(g_bell_stream);
     CloseAudioDevice();
 }
 
@@ -105,7 +268,7 @@ static void fmt_duration(double secs_f, char *out, int sz) {
 
 static void log_session(const char *status) {
     if (g_active_secs < 5.0) return;
-    char path[512];
+    char path[MAX_PATH];
     get_log_path(path, sizeof path);
     FILE *f = fopen(path, "a");
     if (!f) return;
@@ -128,7 +291,7 @@ static int parse_log_duration(const char *s) {
 }
 
 static void cmd_stats(void) {
-    char path[512];
+    char path[MAX_PATH];
     get_log_path(path, sizeof path);
     FILE *f = fopen(path, "r");
     if (!f) { printf("yduts: no log found at %s\n", path); return; }
@@ -150,7 +313,7 @@ static void cmd_stats(void) {
     memset(topic_names, 0, sizeof topic_names);
     memset(topic_secs,  0, sizeof topic_secs);
 
-    char line[512];
+    char line[MAX_PATH * 2];
     while (fgets(line, sizeof line, f)) {
         char ts[32], dur[32], lbl[MAX_LABEL], status[32];
         if (sscanf(line, "%31s | %31s | %127[^|] | %31s", ts, dur, lbl, status) != 4) continue;
@@ -165,9 +328,8 @@ static void cmd_stats(void) {
         if (entry_t >= today_t) { total_today += secs; count_today++; }
         if (strcmp(lbl, "-") != 0) {
             int found = 0;
-            for (int i = 0; i < topic_count; i++) {
+            for (int i = 0; i < topic_count; i++)
                 if (strcmp(topic_names[i], lbl) == 0) { topic_secs[i] += secs; found = 1; break; }
-            }
             if (!found && topic_count < MAX_TOPICS) {
                 snprintf(topic_names[topic_count], MAX_LABEL, "%s", lbl);
                 topic_secs[topic_count++] = secs;
@@ -176,7 +338,6 @@ static void cmd_stats(void) {
     }
     fclose(f);
 
-    /* sort topics by time desc */
     for (int i = 0; i < topic_count - 1; i++)
         for (int j = i+1; j < topic_count; j++)
             if (topic_secs[j] > topic_secs[i]) {
@@ -220,6 +381,34 @@ static int parse_duration(const char *s) {
     return (total > 0) ? total : -1;
 }
 
+/* desktop notification */
+
+static void notify_send(const char *title, const char *body) {
+    /* Sanitize body: replace shell-breaking chars so neither notify-send
+     * nor osascript choke on apostrophes, quotes, or backslashes.          */
+    char safe[512];
+    int j = 0;
+    for (int i = 0; body[i] && j < (int)sizeof(safe) - 1; i++) {
+        char c = body[i];
+        safe[j++] = (c == '\'' || c == '"' || c == '\\') ? '-' : c;
+    }
+    safe[j] = '\0';
+
+    char cmd[1024];
+
+    /* Linux: notify-send, double-quoted (safe[] contains no double-quotes) */
+    snprintf(cmd, sizeof cmd,
+             "notify-send --app-name=yduts --urgency=normal \"%s\" \"%s\" 2>/dev/null &",
+             title, safe);
+    { int _r = system(cmd); (void)_r; }
+
+    /* macOS fallback */
+    snprintf(cmd, sizeof cmd,
+             "osascript -e \"display notification \\\"%s\\\" with title \\\"%s\\\"\" 2>/dev/null &",
+             safe, title);
+    { int _r = system(cmd); (void)_r; }
+}
+
 /* drawing */
 
 #define BG     (Color){ 0,   0,   0,   255 }
@@ -231,10 +420,18 @@ static Font g_font;
 static int  g_font_loaded = 0;
 
 static void load_font(void) {
-    g_font = LoadFontEx("assets/font.ttf", 300, NULL, 0);
+    const char *path = (g_cfg.font[0] != '\0') ? g_cfg.font : "assets/font.ttf";
+    g_font = LoadFontEx(path, 300, NULL, 0);
     if (g_font.texture.id != 0) {
         SetTextureFilter(g_font.texture, TEXTURE_FILTER_BILINEAR);
         g_font_loaded = 1;
+    } else if (g_cfg.font[0] != '\0') {
+        fprintf(stderr, "yduts: could not load font '%s', using default\n", path);
+        g_font = LoadFontEx("assets/font.ttf", 300, NULL, 0);
+        if (g_font.texture.id != 0) {
+            SetTextureFilter(g_font.texture, TEXTURE_FILTER_BILINEAR);
+            g_font_loaded = 1;
+        }
     }
 }
 
@@ -254,42 +451,13 @@ static void draw_centered_text(const char *txt, float y, float font_sz, Color co
     DrawTextEx(g_font, txt, pos, font_sz, spacing, col);
 }
 
-/* returns progress 0.0–1.0 for bar; -1 if not applicable */
-static float get_progress(void) {
-    if (g_mode == MODE_STOPWATCH) return -1.0f;
-    double total = 0;
-    if (g_mode == MODE_COUNTDOWN) total = g_target;
-    else total = (g_pomo_phase == POMO_WORK) ? POMO_WORK_SECS : POMO_BREAK_SECS;
-    if (total <= 0) return -1.0f;
-    float p = (float)(g_elapsed / total);
-    if (p < 0.0f) p = 0.0f;
-    if (p > 1.0f) p = 1.0f;
-    return p;
-}
-
-static void draw_progress_bar(int W, int H, float progress) {
-    /* 2px bar pinned to bottom, dims when paused */
-    int bar_h  = 2;
-    int bar_y  = H - bar_h;
-    int bar_w  = (int)(W * progress);
-
-    Color col = g_finished ? FG_RED : (g_paused ? FG_DIM : FG);
-    col.a = g_paused ? 80 : 160;   /* subtle always, dimmer when paused */
-
-    /* track */
-    DrawRectangle(0, bar_y, W, bar_h, (Color){18, 18, 18, 255});
-    /* fill */
-    if (bar_w > 0)
-        DrawRectangle(0, bar_y, bar_w, bar_h, col);
-}
-
 static void draw_frame(void) {
     int W = GetScreenWidth(), H = GetScreenHeight();
-    float cy = H * 0.48f;
+    float cy = H * 0.5f;
 
     ClearBackground(BG);
 
-    /* ── main timer ── */
+    /* main timer */
     char tbuf[32];
     fmt_time(g_elapsed, tbuf, sizeof tbuf);
 
@@ -305,14 +473,14 @@ static void draw_frame(void) {
     }
     draw_centered_text(tbuf, cy, font_sz, timer_col);
 
-    /* ── session label above timer ── */
+    /* session label above timer */
     if (g_label[0]) {
         float lbl_sz = H * 0.028f;
         if (lbl_sz < 12) lbl_sz = 12;
         draw_centered_text(g_label, cy - font_sz * 0.58f, lbl_sz, FG_DIM);
     }
 
-    /* ── mode/status line below timer ── */
+    /* mode/status line below timer */
     char status[128] = "";
     if (g_mode == MODE_POMODORO) {
         const char *phase = (g_pomo_phase == POMO_WORK) ? "work" : "break";
@@ -328,31 +496,25 @@ static void draw_frame(void) {
     draw_centered_text(status, cy + font_sz * 0.60f, status_sz, FG_DIM);
 
     /* ── mute indicator (top-right, tiny) ── */
-    if (g_bell_muted) {
+    if (g_cfg.mute) {
         float msz = H * 0.018f;
         if (msz < 10) msz = 10;
         float spacing = msz * 0.04f;
-        Vector2 sz = MeasureTextEx(g_font, "muted", msz, spacing);
+        Vector2 sz  = MeasureTextEx(g_font, "muted", msz, spacing);
         Vector2 pos = { W - sz.x - W * 0.02f, H * 0.03f };
         DrawTextEx(g_font, "muted", pos, msz, spacing, (Color){40,40,40,255});
     }
 
-    /* ── key hints (bottom) ── */
+    /* key hints (bottom) */
     const char *hints = "SPACE pause · r restart · m mute · f fullscreen · q quit";
     if (g_mode == MODE_POMODORO)
         hints = "SPACE pause · r restart · n next · m mute · f fullscreen · q quit";
     float hint_sz = H * 0.016f;
     if (hint_sz < 10) hint_sz = 10;
-    /* push hints up a tiny bit so bar doesn't overlap them */
-    draw_centered_text(hints, H - H * 0.05f, hint_sz, (Color){40,40,40,255});
-
-    /* ── progress bar ── */
-    float progress = get_progress();
-    if (progress >= 0.0f)
-        draw_progress_bar(W, H, progress);
+    draw_centered_text(hints, H - H * 0.04f, hint_sz, (Color){40,40,40,255});
 }
 
-/* logic */
+/* LOGIC */
 
 static void restart_session(void) {
     log_session("restarted");
@@ -363,7 +525,8 @@ static void restart_session(void) {
         case MODE_STOPWATCH: g_elapsed = 0.0; break;
         case MODE_COUNTDOWN: g_elapsed = g_target; break;
         case MODE_POMODORO:
-            g_elapsed = (g_pomo_phase == POMO_WORK) ? POMO_WORK_SECS : POMO_BREAK_SECS;
+            g_elapsed = (g_pomo_phase == POMO_WORK)
+                        ? g_cfg.pomo_work_secs : g_cfg.pomo_break_secs;
             break;
     }
 }
@@ -375,14 +538,33 @@ static void next_pomo(void) {
     if (g_pomo_phase == POMO_WORK) { g_pomo_count++; g_pomo_phase = POMO_BREAK; }
     else                           { g_pomo_phase = POMO_WORK; }
     g_finished = 0;
-    g_elapsed  = (g_pomo_phase == POMO_WORK) ? POMO_WORK_SECS : POMO_BREAK_SECS;
+    g_elapsed  = (g_pomo_phase == POMO_WORK)
+                 ? g_cfg.pomo_work_secs : g_cfg.pomo_break_secs;
+}
+
+static void on_finish(void) {
+    bell_play();
+
+    /* desktop notification */
+    if (g_mode == MODE_POMODORO) {
+        const char *phase = (g_pomo_phase == POMO_WORK) ? "Work" : "Break";
+        char body[256];
+        snprintf(body, sizeof body, "%s session done. Press n to continue.",
+                 g_label[0] ? g_label : phase);
+        notify_send("yduts", body);
+    } else {
+        char body[256];
+        snprintf(body, sizeof body, "%s - time's up.",
+                 g_label[0] ? g_label : "countdown");
+        notify_send("yduts", body);
+    }
 }
 
 static void handle_input(void) {
     if (IsKeyPressed(KEY_SPACE)) g_paused = !g_paused;
     if (IsKeyPressed(KEY_R))     restart_session();
     if (IsKeyPressed(KEY_F))     ToggleFullscreen();
-    if (IsKeyPressed(KEY_M))     g_bell_muted = !g_bell_muted;
+    if (IsKeyPressed(KEY_M))     g_cfg.mute = !g_cfg.mute;
     if (IsKeyPressed(KEY_N) && g_mode == MODE_POMODORO) next_pomo();
     if (IsKeyPressed(KEY_Q) || IsKeyPressed(KEY_ESCAPE)) {
         log_session(g_finished ? "completed" : "interrupted");
@@ -407,7 +589,7 @@ static void tick(double dt) {
                 log_session("completed");
                 g_active_secs   = 0.0;
                 g_session_start = time(NULL);
-                bell_play();
+                on_finish();
             }
             break;
         case MODE_POMODORO:
@@ -415,15 +597,17 @@ static void tick(double dt) {
             if (g_elapsed <= 0) {
                 g_elapsed  = 0;
                 g_finished = 1;
-                bell_play();
+                on_finish();
             }
             break;
     }
 }
 
-/* main */
-
 int main(int argc, char **argv) {
+    /* load config before anything else */
+    config_init_file();
+    config_load();
+
     if (argc >= 2 && strcmp(argv[1], "stats") == 0) {
         cmd_stats();
         return 0;
@@ -444,7 +628,7 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[1], "pomodoro") == 0) {
         g_mode       = MODE_POMODORO;
         g_pomo_phase = POMO_WORK;
-        g_elapsed    = POMO_WORK_SECS;
+        g_elapsed    = g_cfg.pomo_work_secs;
     } else {
         int secs = parse_duration(argv[1]);
         if (secs < 0) {
