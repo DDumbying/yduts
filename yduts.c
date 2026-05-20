@@ -7,15 +7,11 @@
 #include <time.h>
 #include <ctype.h>
 
-/* types */
-
 typedef enum { MODE_STOPWATCH = 0, MODE_COUNTDOWN, MODE_POMODORO } Mode;
-typedef enum { POMO_WORK = 0, POMO_BREAK } PomoPhase;
+typedef enum { POMO_WORK = 0, POMO_BREAK, POMO_LONGBREAK } PomoPhase;
 
 #define MAX_LABEL    128
 #define MAX_PATH     512
-
-/* config */
 
 typedef struct {
     char  bell_sound[MAX_PATH];  /* path to .wav/.ogg, empty = use generated */
@@ -23,20 +19,32 @@ typedef struct {
     int   mute;
     int   pomo_work_secs;
     int   pomo_break_secs;
+    int   pomo_longbreak_secs;   /* long break after every N work sessions   */
+    int   pomo_longbreak_every;  /* default 4                                */
     char  font[MAX_PATH];        /* path to .ttf, empty = assets/font.ttf   */
-    /* theme fields reserved for future use */
+
+    /* THEME */
+    Color theme_fg;              /* main text / digits                       */
+    Color theme_bg;              /* background                               */
+    Color theme_dim;             /* dimmed text, paused state                */
+    Color theme_alert;           /* finished / countdown hit zero            */
 } Config;
 
 static Config g_cfg = {
     .bell_sound      = "",
     .bell_volume     = 1.0f,
     .mute            = 0,
-    .pomo_work_secs  = 25 * 60,
-    .pomo_break_secs =  5 * 60,
+    .pomo_work_secs      = 25 * 60,
+    .pomo_break_secs     =  5 * 60,
+    .pomo_longbreak_secs = 15 * 60,
+    .pomo_longbreak_every = 4,
     .font            = "",
+    .theme_fg        = { 230, 230, 230, 255 },
+    .theme_bg        = {   0,   0,   0, 255 },
+    .theme_dim       = {  75,  75,  75, 255 },
+    .theme_alert     = { 200,  80,  80, 255 },
 };
 
-/* trim leading/trailing whitespace in-place */
 static char *trim(char *s) {
     while (isspace((unsigned char)*s)) s++;
     char *end = s + strlen(s);
@@ -100,10 +108,36 @@ static void config_load(void) {
             int s = cfg_parse_duration(val);
             if (s > 0) g_cfg.pomo_break_secs = s;
 
+        } else if (strcmp(key, "pomodoro_longbreak") == 0) {
+            int s = cfg_parse_duration(val);
+            if (s > 0) g_cfg.pomo_longbreak_secs = s;
+
+        } else if (strcmp(key, "pomodoro_longbreak_every") == 0) {
+            int n = atoi(val);
+            if (n > 0) g_cfg.pomo_longbreak_every = n;
+
         } else if (strcmp(key, "font") == 0) {
             snprintf(g_cfg.font, MAX_PATH, "%s", val);
+
+        } else if (strcmp(key, "theme_fg")    == 0 ||
+                   strcmp(key, "theme_bg")    == 0 ||
+                   strcmp(key, "theme_dim")   == 0 ||
+                   strcmp(key, "theme_alert") == 0) {
+            /* parse 6-digit hex: rrggbb (optional leading #) */
+            const char *hex = val;
+            if (*hex == '#') hex++;
+            if (strlen(hex) >= 6) {
+                unsigned int r, g, b;
+                if (sscanf(hex, "%2x%2x%2x", &r, &g, &b) == 3) {
+                    Color c = { (unsigned char)r, (unsigned char)g,
+                                (unsigned char)b, 255 };
+                    if      (strcmp(key, "theme_fg")    == 0) g_cfg.theme_fg    = c;
+                    else if (strcmp(key, "theme_bg")    == 0) g_cfg.theme_bg    = c;
+                    else if (strcmp(key, "theme_dim")   == 0) g_cfg.theme_dim   = c;
+                    else if (strcmp(key, "theme_alert") == 0) g_cfg.theme_alert = c;
+                }
+            }
         }
-        /* unknown keys silently ignored */
     }
     fclose(f);
 }
@@ -135,24 +169,26 @@ static void config_init_file(void) {
         "mute = false\n"
         "\n"
         "# Pomodoro session lengths\n"
-        "pomodoro_work  = 25m\n"
-        "pomodoro_break = 5m\n"
+        "pomodoro_work         = 25m\n"
+        "pomodoro_break        = 5m\n"
+        "pomodoro_longbreak    = 15m\n"
+        "pomodoro_longbreak_every = 4\n"
         "\n"
         "# Custom font: path to any .ttf file.\n"
         "# Defaults to assets/font.ttf (bundled Lora Italic).\n"
         "# font = /home/user/fonts/Caveat-Regular.ttf\n"
         "\n"
-        "# Theme (coming soon)\n"
-        "# theme_fg     = e6e6e6\n"
-        "# theme_bg     = 000000\n"
-        "# theme_dim    = 4b4b4b\n"
-        "# theme_alert  = c85050\n"
+        "# Theme colors (6-digit hex, optional leading #)\n"
+        "# theme_fg    = e6e6e6\n"
+        "# theme_bg    = 000000\n"
+        "# theme_dim   = 4b4b4b\n"
+        "# theme_alert = c85050\n"
     );
     fclose(f);
     fprintf(stderr, "yduts: created default config at %s\n", path);
 }
 
-/* globals */
+/* GLOBALS */
 
 static Mode      g_mode          = MODE_STOPWATCH;
 static double    g_elapsed       = 0.0;
@@ -160,13 +196,18 @@ static double    g_target        = 0.0;
 static int       g_paused        = 0;
 static int       g_finished      = 0;
 static PomoPhase g_pomo_phase    = POMO_WORK;
-static int       g_pomo_count    = 0;
+static int       g_pomo_count    = 0;   /* work sessions completed this cycle */
+static int       g_pomo_cycle    = 0;   /* full cycles (each = N work + longbreak) */
+
+/* auto-advance: after finish, wait this many seconds then call next_pomo() */
+#define AUTO_ADVANCE_SECS 3.0
+static double    g_finish_timer  = 0.0; /* counts up after g_finished = 1 */
 
 static char      g_label[MAX_LABEL] = "";
 static time_t    g_session_start    = 0;
 static double    g_active_secs      = 0.0;
 
-/* bell */
+/* BELL */
 
 #define BELL_SAMPLE_RATE  44100
 #define BELL_DURATION_SEC 1.8f
@@ -180,7 +221,7 @@ static short       g_bell_buf[BELL_SAMPLES];
 static int         g_bell_pos    = -1;
 static int         g_use_stream  = 0;   /* 1 = streaming generated tone */
 
-/* file-sound path */
+/* FILE-SOUND PATH */
 static Sound       g_bell_sound;
 static int         g_use_sound   = 0;   /* 1 = loaded from file */
 
@@ -248,7 +289,7 @@ static void bell_close(void) {
     CloseAudioDevice();
 }
 
-/* log path */
+/* LOG PATH */
 
 static void get_log_path(char *out, int sz) {
     const char *home = getenv("HOME");
@@ -256,7 +297,7 @@ static void get_log_path(char *out, int sz) {
     snprintf(out, sz, "%s/.yduts_log", home);
 }
 
-/* session logging */
+/* SESSION LOGGING */
 
 static void fmt_duration(double secs_f, char *out, int sz) {
     if (secs_f < 0) secs_f = 0;
@@ -282,7 +323,7 @@ static void log_session(const char *status) {
     fclose(f);
 }
 
-/* stats subcommand */
+/* STATS SUBCOMMAND */
 
 static int parse_log_duration(const char *s) {
     int h = 0, m = 0, sec = 0;
@@ -409,12 +450,13 @@ static void notify_send(const char *title, const char *body) {
     { int _r = system(cmd); (void)_r; }
 }
 
-/* drawing */
+/* DRAWING */
 
-#define BG     (Color){ 0,   0,   0,   255 }
-#define FG     (Color){ 230, 230, 230, 255 }
-#define FG_DIM (Color){ 75,  75,  75,  255 }
-#define FG_RED (Color){ 200, 80,  80,  255 }
+/* color shorthands — always read from config (set at startup) */
+#define BG      g_cfg.theme_bg
+#define FG      g_cfg.theme_fg
+#define FG_DIM  g_cfg.theme_dim
+#define FG_RED  g_cfg.theme_alert
 
 static Font g_font;
 static int  g_font_loaded = 0;
@@ -457,7 +499,7 @@ static void draw_frame(void) {
 
     ClearBackground(BG);
 
-    /* main timer */
+    /* MAIN TIMER */
     char tbuf[32];
     fmt_time(g_elapsed, tbuf, sizeof tbuf);
 
@@ -483,50 +525,99 @@ static void draw_frame(void) {
     /* mode/status line below timer */
     char status[128] = "";
     if (g_mode == MODE_POMODORO) {
-        const char *phase = (g_pomo_phase == POMO_WORK) ? "work" : "break";
-        snprintf(status, sizeof status, "pomodoro · %s · %d", phase, g_pomo_count + 1);
+        const char *phase = "work";
+        if (g_pomo_phase == POMO_BREAK)     phase = "break";
+        if (g_pomo_phase == POMO_LONGBREAK) phase = "long break";
+        snprintf(status, sizeof status, "pomodoro - %s", phase);
     } else if (g_mode == MODE_COUNTDOWN) {
         snprintf(status, sizeof status, "countdown");
     } else {
         snprintf(status, sizeof status, "stopwatch");
     }
-    if (g_paused) { size_t n = strlen(status); snprintf(status+n, sizeof status-n, " · paused"); }
+    if (g_paused) { size_t n = strlen(status); snprintf(status+n, sizeof status-n, " - paused"); }
+    if (g_mode == MODE_POMODORO && g_finished) {
+        int remaining = (int)(AUTO_ADVANCE_SECS - g_finish_timer) + 1;
+        size_t n = strlen(status);
+        snprintf(status+n, sizeof status-n, "  (next in %ds)", remaining);
+    }
     float status_sz = H * 0.022f;
     if (status_sz < 11) status_sz = 11;
-    draw_centered_text(status, cy + font_sz * 0.60f, status_sz, FG_DIM);
+    float status_y = cy + font_sz * 0.60f;
+    draw_centered_text(status, status_y, status_sz, FG_DIM);
 
-    /* ── mute indicator (top-right, tiny) ── */
+    /* session dots (pomodoro only) */
+    if (g_mode == MODE_POMODORO) {
+        int   total  = g_cfg.pomo_longbreak_every;
+        float dot_r  = H * 0.012f;
+        if (dot_r < 4) dot_r = 4;
+        float gap    = dot_r * 2.8f;
+        float row_w  = total * gap - (gap - dot_r * 2.0f);
+        float dot_x  = (W - row_w) * 0.5f + dot_r;
+        float dot_y  = status_y + status_sz * 1.8f;
+
+        /* pulse for current work session: 0.6–1.0 alpha, 1 Hz */
+        float pulse  = 0.6f + 0.4f * (0.5f + 0.5f * sinf((float)GetTime() * 2.0f * PI));
+
+        for (int i = 0; i < total; i++) {
+            float cx2 = dot_x + i * gap;
+            if (i < g_pomo_count) {
+                /* completed this cycle — filled */
+                DrawCircleV((Vector2){cx2, dot_y}, dot_r, FG_DIM);
+            } else if (i == g_pomo_count && g_pomo_phase == POMO_WORK) {
+                /* current work session — pulsing */
+                Color pc = FG;
+                pc.a = (unsigned char)(pulse * 255);
+                DrawCircleV((Vector2){cx2, dot_y}, dot_r, pc);
+            } else {
+                /* upcoming — hollow ring */
+                DrawCircleLines((int)cx2, (int)dot_y, dot_r,
+                    ( (Color){ g_cfg.theme_dim.r/2, g_cfg.theme_dim.g/2,
+                               g_cfg.theme_dim.b/2, 255 } ));
+            }
+        }
+    }
+
+    /* mute indicator (top-right, tiny) */
     if (g_cfg.mute) {
         float msz = H * 0.018f;
         if (msz < 10) msz = 10;
         float spacing = msz * 0.04f;
         Vector2 sz  = MeasureTextEx(g_font, "muted", msz, spacing);
         Vector2 pos = { W - sz.x - W * 0.02f, H * 0.03f };
-        DrawTextEx(g_font, "muted", pos, msz, spacing, (Color){40,40,40,255});
+        DrawTextEx(g_font, "muted", pos, msz, spacing, ( (Color){ g_cfg.theme_dim.r/2, g_cfg.theme_dim.g/2, g_cfg.theme_dim.b/2, 255 } ));
     }
 
     /* key hints (bottom) */
-    const char *hints = "SPACE pause · r restart · m mute · f fullscreen · q quit";
+    const char *hints = "SPACE pause  r restart  m mute  f fullscreen  q quit";
     if (g_mode == MODE_POMODORO)
-        hints = "SPACE pause · r restart · n next · m mute · f fullscreen · q quit";
+        hints = "SPACE pause  r restart  n next  m mute  f fullscreen  q quit";
     float hint_sz = H * 0.016f;
     if (hint_sz < 10) hint_sz = 10;
-    draw_centered_text(hints, H - H * 0.04f, hint_sz, (Color){40,40,40,255});
+    draw_centered_text(hints, H - H * 0.04f, hint_sz, ( (Color){ g_cfg.theme_dim.r/2, g_cfg.theme_dim.g/2, g_cfg.theme_dim.b/2, 255 } ));
 }
 
 /* LOGIC */
+
+static int pomo_current_secs(void) {
+    switch (g_pomo_phase) {
+        case POMO_WORK:      return g_cfg.pomo_work_secs;
+        case POMO_BREAK:     return g_cfg.pomo_break_secs;
+        case POMO_LONGBREAK: return g_cfg.pomo_longbreak_secs;
+    }
+    return g_cfg.pomo_work_secs;
+}
 
 static void restart_session(void) {
     log_session("restarted");
     g_active_secs   = 0.0;
     g_session_start = time(NULL);
-    g_finished = 0;
+    g_finished      = 0;
+    g_finish_timer  = 0.0;
     switch (g_mode) {
         case MODE_STOPWATCH: g_elapsed = 0.0; break;
         case MODE_COUNTDOWN: g_elapsed = g_target; break;
         case MODE_POMODORO:
-            g_elapsed = (g_pomo_phase == POMO_WORK)
-                        ? g_cfg.pomo_work_secs : g_cfg.pomo_break_secs;
+            g_elapsed = pomo_current_secs();
             break;
     }
 }
@@ -535,11 +626,27 @@ static void next_pomo(void) {
     log_session(g_finished ? "completed" : "skipped");
     g_active_secs   = 0.0;
     g_session_start = time(NULL);
-    if (g_pomo_phase == POMO_WORK) { g_pomo_count++; g_pomo_phase = POMO_BREAK; }
-    else                           { g_pomo_phase = POMO_WORK; }
-    g_finished = 0;
-    g_elapsed  = (g_pomo_phase == POMO_WORK)
-                 ? g_cfg.pomo_work_secs : g_cfg.pomo_break_secs;
+    g_finished      = 0;
+    g_finish_timer  = 0.0;
+
+    if (g_pomo_phase == POMO_WORK) {
+        g_pomo_count++;
+        /* every N work sessions → long break, then reset cycle */
+        if (g_pomo_count >= g_cfg.pomo_longbreak_every) {
+            g_pomo_phase = POMO_LONGBREAK;
+        } else {
+            g_pomo_phase = POMO_BREAK;
+        }
+    } else {
+        /* after any break (short or long) → back to work */
+        if (g_pomo_phase == POMO_LONGBREAK) {
+            g_pomo_cycle++;
+            g_pomo_count = 0;   /* reset dot counter for new cycle */
+        }
+        g_pomo_phase = POMO_WORK;
+    }
+
+    g_elapsed = pomo_current_secs();
 }
 
 static void on_finish(void) {
@@ -547,7 +654,9 @@ static void on_finish(void) {
 
     /* desktop notification */
     if (g_mode == MODE_POMODORO) {
-        const char *phase = (g_pomo_phase == POMO_WORK) ? "Work" : "Break";
+        const char *phase = "Work";
+        if (g_pomo_phase == POMO_BREAK)     phase = "Break";
+        if (g_pomo_phase == POMO_LONGBREAK) phase = "Long break";
         char body[256];
         snprintf(body, sizeof body, "%s session done. Press n to continue.",
                  g_label[0] ? g_label : phase);
@@ -575,7 +684,17 @@ static void handle_input(void) {
 
 static void tick(double dt) {
     if (!g_paused && !g_finished) g_active_secs += dt;
-    if (g_paused || g_finished)   return;
+
+    /* auto-advance pomodoro after bell — runs even while g_finished */
+    if (g_mode == MODE_POMODORO && g_finished && !g_paused) {
+        g_finish_timer += dt;
+        if (g_finish_timer >= AUTO_ADVANCE_SECS) {
+            next_pomo();
+            return;
+        }
+    }
+
+    if (g_paused || g_finished) return;
 
     switch (g_mode) {
         case MODE_STOPWATCH:
@@ -595,13 +714,16 @@ static void tick(double dt) {
         case MODE_POMODORO:
             g_elapsed -= dt;
             if (g_elapsed <= 0) {
-                g_elapsed  = 0;
-                g_finished = 1;
+                g_elapsed      = 0;
+                g_finished     = 1;
+                g_finish_timer = 0.0;
                 on_finish();
             }
             break;
     }
 }
+
+/* main */
 
 int main(int argc, char **argv) {
     /* load config before anything else */
@@ -628,7 +750,7 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[1], "pomodoro") == 0) {
         g_mode       = MODE_POMODORO;
         g_pomo_phase = POMO_WORK;
-        g_elapsed    = g_cfg.pomo_work_secs;
+        g_elapsed    = pomo_current_secs();
     } else {
         int secs = parse_duration(argv[1]);
         if (secs < 0) {
