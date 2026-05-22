@@ -3,9 +3,7 @@
 A minimal studying timer. Black screen. White digits. Nothing else.
 Aesthetic inspired by [sowon](https://github.com/tsoding/sowon).
 
-```
-00:25:00
-```
+<img src="./assets/images/watch.png" width="100%" />
 
 ## Build
 
